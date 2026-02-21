@@ -33,6 +33,8 @@ cd grolars && R CMD INSTALL . --no-multiarch
 ## ⚠️ Avisos
 
 Este paquete es **altamente experimental, sin ninguna garantía**. Si su sistema se rompe o su R se desconfigura, es su responsabilidad.
+
+
 ![](imgs_readme/unberlini.png)
 
 Se recomienda el uso en contenedores o máquinas virtuales. **No apto para producción.**
