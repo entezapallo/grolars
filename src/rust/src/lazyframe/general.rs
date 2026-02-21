@@ -1,0 +1,1512 @@
+use crate::{
+    PlRDataFrame, PlRDataType, PlRExpr, PlRLazyFrame, PlRLazyGroupBy, PlRSeries, RPolarsErr,
+    expr::selector::PlRSelector,
+    functions::parse_cloud_options,
+    lazyframe::PlROptFlags,
+    prelude::{sync_on_close::SyncOnCloseType, *},
+};
+use polars::{
+    io::{HiveOptions, RowIndex, ndjson::NDJsonWriterOptions},
+    polars_utils::slice_enum::Slice,
+};
+use savvy::{
+    ListSexp, LogicalSexp, NumericScalar, ObjSexp, OwnedListSexp, OwnedStringSexp, Result, Sexp,
+    StringSexp, savvy,
+};
+use std::num::NonZeroUsize;
+
+#[savvy]
+impl PlRLazyFrame {
+    fn describe_plan(&self) -> Result<Sexp> {
+        let string = self.ldf.describe_plan().map_err(RPolarsErr::from)?;
+        let sexp = OwnedStringSexp::try_from_scalar(string)?;
+        Ok(sexp.into())
+    }
+
+    fn describe_optimized_plan(&self) -> Result<Sexp> {
+        let string = self
+            .ldf
+            .describe_optimized_plan()
+            .map_err(RPolarsErr::from)?;
+        let sexp = OwnedStringSexp::try_from_scalar(string)?;
+        Ok(sexp.into())
+    }
+
+    fn describe_plan_tree(&self) -> Result<Sexp> {
+        let string = self.ldf.describe_plan_tree().map_err(RPolarsErr::from)?;
+        let sexp = OwnedStringSexp::try_from_scalar(string)?;
+        Ok(sexp.into())
+    }
+
+    fn describe_optimized_plan_tree(&self) -> Result<Sexp> {
+        let string = self
+            .ldf
+            .describe_optimized_plan_tree()
+            .map_err(RPolarsErr::from)?;
+        let sexp = OwnedStringSexp::try_from_scalar(string)?;
+        Ok(sexp.into())
+    }
+
+    fn sink_batches(
+        &self,
+        lambda: savvy::FunctionSexp,
+        maintain_order: bool,
+        chunk_size: Option<NumericScalar>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use crate::r_udf::RUdf;
+
+            let chunk_size = chunk_size
+                .map(<Wrap<NonZeroUsize>>::try_from)
+                .transpose()?
+                .map(|w| w.0);
+
+            let ldf = self.ldf.clone();
+            ldf.sink_batches(
+                <PlanCallback<DataFrame, bool>>::from(RUdf::new(lambda)),
+                maintain_order,
+                chunk_size,
+            )
+            .map(Into::into)
+            .map_err(RPolarsErr::from)
+            .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn filter(&mut self, predicate: &PlRExpr) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.filter(predicate.inner.clone()).into())
+    }
+
+    fn remove(&self, predicate: &PlRExpr) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.remove(predicate.inner.clone()).into())
+    }
+
+    fn select(&mut self, exprs: ListSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let exprs = <Wrap<Vec<Expr>>>::try_from(exprs)?.0;
+        Ok(ldf.select(exprs).into())
+    }
+
+    fn group_by(&mut self, by: ListSexp, maintain_order: bool) -> Result<PlRLazyGroupBy> {
+        let ldf = self.ldf.clone();
+        let by = <Wrap<Vec<Expr>>>::try_from(by)?.0;
+        let lazy_gb = if maintain_order {
+            ldf.group_by_stable(by)
+        } else {
+            ldf.group_by(by)
+        };
+
+        Ok(lazy_gb.into())
+    }
+
+    fn collect(&self, engine: &str) -> Result<PlRDataFrame> {
+        use crate::{
+            r_threads::{ThreadCom, concurrent_handler},
+            r_udf::{CONFIG, RUdfReturn, RUdfSignature},
+        };
+        fn serve_r(
+            udf_sig: RUdfSignature,
+        ) -> std::result::Result<RUdfReturn, Box<dyn std::error::Error>> {
+            udf_sig.eval()
+        }
+
+        let ldf = self.ldf.clone();
+        let engine = <Wrap<Engine>>::try_from(engine)?.0;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let df = if ThreadCom::try_from_global(&CONFIG).is_ok() {
+            ldf.collect_with_engine(engine).map_err(RPolarsErr::from)?
+        } else {
+            concurrent_handler(
+                // closure 1: spawned by main thread
+                // tc is a ThreadCom which any child thread can use to submit R jobs to main thread
+                move |tc| {
+                    // get return value
+                    let retval = ldf.collect_with_engine(engine);
+
+                    // drop the last two ThreadCom clones, signals to main/R-serving thread to shut down.
+                    ThreadCom::kill_global(&CONFIG);
+                    drop(tc);
+
+                    retval
+                },
+                // closure 2: how to serve polars worker R job request in main thread
+                serve_r,
+                // CONFIG is "global variable" where any new thread can request a clone of ThreadCom to establish contact with main thread
+                &CONFIG,
+            )
+            .map_err(|e| e.to_string())?
+            .map_err(RPolarsErr::from)?
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let df = ldf.collect().map_err(RPolarsErr::from)?;
+
+        Ok(df.into())
+    }
+
+    fn slice(&self, offset: NumericScalar, len: Option<NumericScalar>) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let offset = <Wrap<i64>>::try_from(offset)?.0;
+        let len = len.map(<Wrap<u32>>::try_from).transpose()?.map(|l| l.0);
+        Ok(ldf.slice(offset, len.unwrap_or(u32::MAX)).into())
+    }
+
+    fn tail(&self, n: NumericScalar) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let n = <Wrap<u32>>::try_from(n)?.0;
+        Ok(ldf.tail(n).into())
+    }
+
+    fn drop(&self, columns: &PlRSelector) -> Result<Self> {
+        Ok(self.ldf.clone().drop(columns.inner.clone()).into())
+    }
+
+    fn cast(&self, dtypes: ListSexp, strict: bool) -> Result<Self> {
+        let dtypes = <Wrap<Vec<Field>>>::try_from(dtypes)?.0;
+        let mut cast_map = PlHashMap::with_capacity(dtypes.len());
+        cast_map.extend(dtypes.iter().map(|f| (f.name.as_ref(), f.dtype.clone())));
+        Ok(self.ldf.clone().cast(cast_map, strict).into())
+    }
+
+    fn cast_all(&self, dtype: &PlRDataType, strict: bool) -> Result<Self> {
+        Ok(self.ldf.clone().cast_all(dtype.dt.clone(), strict).into())
+    }
+
+    fn collect_schema(&mut self) -> Result<Sexp> {
+        let schema = self.ldf.collect_schema().map_err(RPolarsErr::from)?;
+        let mut out = OwnedListSexp::new(schema.len(), true)?;
+        for (i, (name, dtype)) in schema.iter().enumerate() {
+            let value: Sexp = PlRDataType::from(dtype.clone()).try_into()?;
+            let _ = out.set_name_and_value(i, name.as_str(), value);
+        }
+        Ok(out.into())
+    }
+
+    fn sort_by_exprs(
+        &self,
+        by: ListSexp,
+        descending: LogicalSexp,
+        nulls_last: LogicalSexp,
+        maintain_order: bool,
+        multithreaded: bool,
+    ) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let by = <Wrap<Vec<Expr>>>::try_from(by)?.0;
+        Ok(ldf
+            .sort_by_exprs(
+                by,
+                SortMultipleOptions {
+                    descending: descending.to_vec(),
+                    nulls_last: nulls_last.to_vec(),
+                    maintain_order,
+                    multithreaded,
+                    limit: None,
+                },
+            )
+            .into())
+    }
+
+    fn with_columns(&mut self, exprs: ListSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let exprs = <Wrap<Vec<Expr>>>::try_from(exprs)?.0;
+        Ok(ldf.with_columns(exprs).into())
+    }
+
+    fn to_dot(&self, optimized: bool) -> Result<Sexp> {
+        let result: OwnedStringSexp = self
+            .ldf
+            .to_dot(optimized)
+            .map_err(RPolarsErr::from)?
+            .try_into()?;
+        Ok(result.into())
+    }
+
+    fn sort(
+        &self,
+        by_column: &str,
+        descending: bool,
+        nulls_last: bool,
+        maintain_order: bool,
+        multithreaded: bool,
+    ) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf
+            .sort(
+                [by_column],
+                SortMultipleOptions {
+                    descending: vec![descending],
+                    nulls_last: vec![nulls_last],
+                    multithreaded,
+                    maintain_order,
+                    limit: None,
+                },
+            )
+            .into())
+    }
+
+    fn top_k(&self, k: NumericScalar, by: ListSexp, reverse: LogicalSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let k = <Wrap<u32>>::try_from(k)?.0;
+        let exprs = <Wrap<Vec<Expr>>>::try_from(by)?.0;
+        let reverse = reverse.to_vec();
+        Ok(ldf
+            .top_k(
+                k,
+                exprs,
+                SortMultipleOptions::new().with_order_descending_multi(reverse),
+            )
+            .into())
+    }
+
+    fn bottom_k(&self, k: NumericScalar, by: ListSexp, reverse: LogicalSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let k = <Wrap<u32>>::try_from(k)?.0;
+        let exprs = <Wrap<Vec<Expr>>>::try_from(by)?.0;
+        let reverse = reverse.to_vec();
+        Ok(ldf
+            .bottom_k(
+                k,
+                exprs,
+                SortMultipleOptions::new().with_order_descending_multi(reverse),
+            )
+            .into())
+    }
+
+    fn cache(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.cache().into())
+    }
+
+    fn with_optimizations(&self, optimizations: ObjSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let optimizations = <PlROptFlags>::try_from(optimizations)?;
+        Ok(ldf
+            .with_optimizations(optimizations.inner.into_inner())
+            .into())
+    }
+
+    fn profile(&self) -> Result<Sexp> {
+        use crate::{
+            r_threads::{ThreadCom, concurrent_handler},
+            r_udf::{CONFIG, RUdfReturn, RUdfSignature},
+        };
+        fn serve_r(
+            udf_sig: RUdfSignature,
+        ) -> std::result::Result<RUdfReturn, Box<dyn std::error::Error>> {
+            udf_sig.eval()
+        }
+
+        let ldf = self.ldf.clone();
+        let (data, timings) = if ThreadCom::try_from_global(&CONFIG).is_ok() {
+            let ldf = self.ldf.clone();
+            ldf.profile().map_err(RPolarsErr::from)?
+        } else {
+            concurrent_handler(
+                // closure 1: spawned by main thread
+                // tc is a ThreadCom which any child thread can use to submit R jobs to main thread
+                move |tc| {
+                    // get return value
+                    let retval = ldf.profile();
+
+                    // drop the last two ThreadCom clones, signals to main/R-serving thread to shut down.
+                    ThreadCom::kill_global(&CONFIG);
+                    drop(tc);
+
+                    retval
+                },
+                // closure 2: how to serve polars worker R job request in main thread
+                serve_r,
+                // CONFIG is "global variable" where any new thread can request a clone of ThreadCom to establish contact with main thread
+                &CONFIG,
+            )
+            .map_err(|e| e.to_string())?
+            .map_err(RPolarsErr::from)?
+        };
+
+        let data = <PlRDataFrame>::from(data);
+        let timings = <PlRDataFrame>::from(timings);
+
+        let mut out = OwnedListSexp::new(2, true)?;
+        unsafe {
+            out.set_value_unchecked(0, Sexp::try_from(data)?.0);
+            out.set_value_unchecked(1, Sexp::try_from(timings)?.0);
+        };
+        Ok(out.into())
+    }
+
+    fn select_seq(&mut self, exprs: ListSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let exprs = <Wrap<Vec<Expr>>>::try_from(exprs)?.0;
+        Ok(ldf.select_seq(exprs).into())
+    }
+
+    fn rolling(
+        &mut self,
+        index_column: &PlRExpr,
+        period: &str,
+        offset: &str,
+        closed: &str,
+        by: ListSexp,
+    ) -> Result<PlRLazyGroupBy> {
+        let closed_window = <Wrap<ClosedWindow>>::try_from(closed)?.0;
+        let ldf = self.ldf.clone();
+        let by = <Wrap<Vec<Expr>>>::try_from(by)?.0;
+        let lazy_gb = ldf.rolling(
+            index_column.inner.clone(),
+            by,
+            RollingGroupOptions {
+                index_column: "".into(),
+                period: Duration::try_parse(period).map_err(RPolarsErr::from)?,
+                offset: Duration::try_parse(offset).map_err(RPolarsErr::from)?,
+                closed_window,
+            },
+        );
+
+        Ok(PlRLazyGroupBy { lgb: Some(lazy_gb) })
+    }
+
+    fn group_by_dynamic(
+        &mut self,
+        index_column: &PlRExpr,
+        every: &str,
+        period: &str,
+        offset: &str,
+        label: &str,
+        include_boundaries: bool,
+        closed: &str,
+        group_by: ListSexp,
+        start_by: &str,
+    ) -> Result<PlRLazyGroupBy> {
+        let closed_window = <Wrap<ClosedWindow>>::try_from(closed)?.0;
+        let group_by = <Wrap<Vec<Expr>>>::try_from(group_by)?.0;
+        let ldf = self.ldf.clone();
+        let label = <Wrap<Label>>::try_from(label)?.0;
+        let start_by = <Wrap<StartBy>>::try_from(start_by)?.0;
+        let lazy_gb = ldf.group_by_dynamic(
+            index_column.inner.clone(),
+            group_by,
+            DynamicGroupOptions {
+                every: Duration::try_parse(every).map_err(RPolarsErr::from)?,
+                period: Duration::try_parse(period).map_err(RPolarsErr::from)?,
+                offset: Duration::try_parse(offset).map_err(RPolarsErr::from)?,
+                label,
+                include_boundaries,
+                closed_window,
+                start_by,
+                ..Default::default()
+            },
+        );
+
+        Ok(PlRLazyGroupBy { lgb: Some(lazy_gb) })
+    }
+
+    fn join_asof(
+        &self,
+        other: &PlRLazyFrame,
+        left_on: &PlRExpr,
+        right_on: &PlRExpr,
+        allow_parallel: bool,
+        force_parallel: bool,
+        suffix: &str,
+        coalesce: bool,
+        strategy: &str,
+        allow_eq: bool,
+        check_sortedness: bool,
+        left_by: Option<StringSexp>,
+        right_by: Option<StringSexp>,
+        tolerance: Option<&PlRSeries>,
+        tolerance_str: Option<&str>,
+    ) -> Result<Self> {
+        let coalesce = if coalesce {
+            JoinCoalesce::CoalesceColumns
+        } else {
+            JoinCoalesce::KeepColumns
+        };
+        let strategy = <Wrap<AsofStrategy>>::try_from(strategy)?.0;
+        let ldf = self.ldf.clone();
+        let other = other.ldf.clone();
+        let left_on = left_on.inner.clone();
+        let right_on = right_on.inner.clone();
+        let left_by = left_by.map(strings_to_pl_smallstr);
+        let right_by = right_by.map(strings_to_pl_smallstr);
+        let tolerance = match tolerance {
+            Some(s) => {
+                let av = s
+                    .series
+                    .clone()
+                    .get(0)
+                    .map_err(RPolarsErr::from)?
+                    .into_static();
+                Some(Scalar::new(av.dtype(), av))
+            }
+            None => None,
+        };
+        Ok(ldf
+            .join_builder()
+            .with(other)
+            .left_on([left_on])
+            .right_on([right_on])
+            .allow_parallel(allow_parallel)
+            .force_parallel(force_parallel)
+            .coalesce(coalesce)
+            .how(JoinType::AsOf(Box::new(AsOfOptions {
+                strategy,
+                left_by,
+                right_by,
+                tolerance,
+                tolerance_str: tolerance_str.map(|s| s.into()),
+                allow_eq,
+                check_sortedness,
+            })))
+            .suffix(suffix)
+            .finish()
+            .into())
+    }
+
+    fn join(
+        &self,
+        other: &PlRLazyFrame,
+        left_on: ListSexp,
+        right_on: ListSexp,
+        allow_parallel: bool,
+        force_parallel: bool,
+        nulls_equal: bool,
+        how: &str,
+        suffix: &str,
+        validate: &str,
+        maintain_order: &str,
+        coalesce: Option<bool>,
+    ) -> Result<Self> {
+        let coalesce = match coalesce {
+            None => JoinCoalesce::JoinSpecific,
+            Some(true) => JoinCoalesce::CoalesceColumns,
+            Some(false) => JoinCoalesce::KeepColumns,
+        };
+        let ldf = self.ldf.clone();
+        let other = other.ldf.clone();
+        let left_on = <Wrap<Vec<Expr>>>::try_from(left_on)?.0;
+        let right_on = <Wrap<Vec<Expr>>>::try_from(right_on)?.0;
+
+        let how = <Wrap<JoinType>>::try_from(how)?.0;
+        let maintain_order = <Wrap<MaintainOrderJoin>>::try_from(maintain_order)?.0;
+        let validate = <Wrap<JoinValidation>>::try_from(validate)?.0;
+        Ok(ldf
+            .join_builder()
+            .with(other)
+            .left_on(left_on)
+            .right_on(right_on)
+            .allow_parallel(allow_parallel)
+            .force_parallel(force_parallel)
+            .join_nulls(nulls_equal)
+            .how(how)
+            .coalesce(coalesce)
+            .validate(validate)
+            .suffix(suffix)
+            .maintain_order(maintain_order)
+            .finish()
+            .into())
+    }
+
+    fn join_where(&self, other: &PlRLazyFrame, predicates: ListSexp, suffix: &str) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let other = other.ldf.clone();
+        let predicates = <Wrap<Vec<Expr>>>::try_from(predicates)?.0;
+
+        Ok(ldf
+            .join_builder()
+            .with(other)
+            .suffix(suffix)
+            .join_where(predicates)
+            .into())
+    }
+
+    fn with_columns_seq(&mut self, exprs: ListSexp) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let exprs = <Wrap<Vec<Expr>>>::try_from(exprs)?.0;
+        Ok(ldf.with_columns_seq(exprs).into())
+    }
+
+    fn rename(&mut self, existing: StringSexp, new: StringSexp, strict: bool) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.rename(existing.to_vec(), new.to_vec(), strict).into())
+    }
+
+    fn reverse(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.reverse().into())
+    }
+
+    fn shift(&self, n: &PlRExpr, fill_value: Option<&PlRExpr>) -> Result<Self> {
+        let lf = self.ldf.clone();
+        let out = match fill_value {
+            Some(v) => lf.shift_and_fill(n.inner.clone(), v.inner.clone()),
+            None => lf.shift(n.inner.clone()),
+        };
+        Ok(out.into())
+    }
+
+    fn fill_nan(&self, fill_value: &PlRExpr) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.fill_nan(fill_value.inner.clone()).into())
+    }
+
+    fn min(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let out = ldf.min();
+        Ok(out.into())
+    }
+
+    fn max(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let out = ldf.max();
+        Ok(out.into())
+    }
+
+    fn sum(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let out = ldf.sum();
+        Ok(out.into())
+    }
+
+    fn mean(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let out = ldf.mean();
+        Ok(out.into())
+    }
+
+    fn std(&self, ddof: NumericScalar) -> Result<Self> {
+        let ddof = <Wrap<u8>>::try_from(ddof)?.0;
+        let ldf = self.ldf.clone();
+        let out = ldf.std(ddof);
+        Ok(out.into())
+    }
+
+    fn var(&self, ddof: NumericScalar) -> Result<Self> {
+        let ddof = <Wrap<u8>>::try_from(ddof)?.0;
+        let ldf = self.ldf.clone();
+        let out = ldf.var(ddof);
+        Ok(out.into())
+    }
+
+    fn median(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let out = ldf.median();
+        Ok(out.into())
+    }
+
+    fn quantile(&self, quantile: &PlRExpr, interpolation: &str) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let interpolation = <Wrap<QuantileMethod>>::try_from(interpolation)?.0;
+        let out = ldf.quantile(quantile.inner.clone(), interpolation);
+        Ok(out.into())
+    }
+
+    fn explode(&self, subset: &PlRSelector, empty_as_null: bool, keep_nulls: bool) -> Result<Self> {
+        Ok(self
+            .ldf
+            .clone()
+            .explode(
+                subset.inner.clone(),
+                ExplodeOptions {
+                    empty_as_null,
+                    keep_nulls,
+                },
+            )
+            .into())
+    }
+
+    fn null_count(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.null_count().into())
+    }
+
+    fn unique(&self, maintain_order: bool, keep: &str, subset: Option<ListSexp>) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let keep = <Wrap<UniqueKeepStrategy>>::try_from(keep)?.0;
+        let subset = subset
+            .map(<Wrap<Vec<Expr>>>::try_from)
+            .transpose()?
+            .map(|w| w.0);
+        let out = match maintain_order {
+            true => ldf.unique_stable_generic(subset, keep),
+            false => ldf.unique_generic(subset, keep),
+        };
+        Ok(out.into())
+    }
+
+    fn drop_nulls(&self, subset: Option<&PlRSelector>) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let subset = subset.map(|e| e.inner.clone());
+        Ok(ldf.drop_nulls(subset).into())
+    }
+
+    fn drop_nans(&self, subset: Option<&PlRSelector>) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let subset = subset.map(|e| e.inner.clone());
+        Ok(ldf.drop_nans(subset).into())
+    }
+
+    fn pivot(
+        &self,
+        on: &PlRSelector,
+        on_columns: &PlRDataFrame,
+        index: &PlRSelector,
+        values: &PlRSelector,
+        agg: &PlRExpr,
+        maintain_order: bool,
+        separator: &str,
+    ) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf
+            .pivot(
+                on.inner.clone(),
+                Arc::new(on_columns.df.clone()),
+                index.inner.clone(),
+                values.inner.clone(),
+                agg.inner.clone(),
+                maintain_order,
+                separator.into(),
+            )
+            .into())
+    }
+
+    fn unpivot(
+        &self,
+        index: &PlRSelector,
+        on: Option<&PlRSelector>,
+        value_name: Option<&str>,
+        variable_name: Option<&str>,
+    ) -> Result<Self> {
+        let args = UnpivotArgsDSL {
+            on: on.map(|e| e.inner.clone()),
+            index: index.inner.clone(),
+            value_name: value_name.map(|s| s.into()),
+            variable_name: variable_name.map(|s| s.into()),
+        };
+
+        let ldf = self.ldf.clone();
+        Ok(ldf.unpivot(args).into())
+    }
+
+    fn with_row_index(&self, name: &str, offset: Option<NumericScalar>) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        let offset: Option<u32> = match offset {
+            Some(x) => Some(<Wrap<u32>>::try_from(x)?.0),
+            None => None,
+        };
+        Ok(ldf.with_row_index(name, offset).into())
+    }
+
+    fn clone(&self) -> Result<Self> {
+        Ok(self.ldf.clone().into())
+    }
+
+    fn unnest(&self, columns: &PlRSelector, separator: Option<&str>) -> Result<Self> {
+        Ok(self
+            .ldf
+            .clone()
+            .unnest(columns.inner.clone(), separator.map(PlSmallStr::from_str))
+            .into())
+    }
+
+    fn count(&self) -> Result<Self> {
+        let ldf = self.ldf.clone();
+        Ok(ldf.count().into())
+    }
+
+    fn merge_sorted(&self, other: &PlRLazyFrame, key: &str) -> Result<Self> {
+        let out = self
+            .ldf
+            .clone()
+            .merge_sorted(other.ldf.clone(), key)
+            .map_err(RPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    fn new_from_ipc(
+        source: StringSexp,
+        cache: bool,
+        rechunk: bool,
+        try_parse_hive_dates: bool,
+        row_index_offset: NumericScalar,
+        n_rows: Option<NumericScalar>,
+        row_index_name: Option<&str>,
+        storage_options: Option<StringSexp>,
+        hive_partitioning: Option<bool>,
+        hive_schema: Option<ListSexp>,
+        include_file_paths: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let options = IpcScanOptions::default();
+
+            let sources = <Wrap<ScanSources>>::try_from(source)?.0;
+            let row_index_offset = <Wrap<u32>>::try_from(row_index_offset)?.0;
+            let hive_schema = match hive_schema {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?),
+                None => None,
+            };
+            let n_rows = match n_rows {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let row_index = row_index_name.map(|x| RowIndex {
+                name: x.into(),
+                offset: row_index_offset,
+            });
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+            let hive_options = HiveOptions {
+                enabled: hive_partitioning,
+                hive_start_idx: 0,
+                schema: hive_schema.map(|x| Arc::new(x.0)),
+                try_parse_dates: try_parse_hive_dates,
+            };
+
+            let first_path = sources.first_path().map(|p| p.to_owned());
+            let cloud_schema = first_path.and_then(|p| CloudScheme::from_path(p.as_str()));
+
+            let cloud_options = parse_cloud_options(cloud_schema, storage_options)?;
+
+            let unified_scan_args = UnifiedScanArgs {
+                cloud_options,
+                pre_slice: n_rows.map(|len| Slice::Positive { offset: 0, len }),
+                cache,
+                rechunk,
+                row_index,
+                hive_options,
+                include_file_paths: include_file_paths.map(|x| x.into()),
+                ..Default::default()
+            };
+
+            let lf = LazyFrame::scan_ipc_sources(sources, options, unified_scan_args)
+                .map_err(RPolarsErr::from)?;
+            Ok(lf.into())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn new_from_scan_lines(
+        source: StringSexp,
+        name: &str,
+        row_index_offset: NumericScalar,
+        glob: bool,
+        n_rows: Option<NumericScalar>,
+        row_index_name: Option<&str>,
+        storage_options: Option<StringSexp>,
+        include_file_paths: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let sources = <Wrap<ScanSources>>::try_from(source)?.0;
+            let row_index_offset = <Wrap<u32>>::try_from(row_index_offset)?.0;
+            let n_rows = match n_rows {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let row_index = row_index_name.map(|x| RowIndex {
+                name: x.into(),
+                offset: row_index_offset,
+            });
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let first_path = sources.first_path().map(|p| p.to_owned());
+            let cloud_schema = first_path.and_then(|p| CloudScheme::from_path(p.as_str()));
+
+            let cloud_options = parse_cloud_options(cloud_schema, storage_options)?;
+
+            let unified_scan_args = UnifiedScanArgs {
+                cloud_options,
+                pre_slice: n_rows.map(|len| Slice::Positive { offset: 0, len }),
+                row_index,
+                include_file_paths: include_file_paths.map(|x| x.into()),
+                glob,
+                ..Default::default()
+            };
+
+            let dsl: DslPlan =
+                DslBuilder::scan_lines(sources, unified_scan_args, PlSmallStr::from(name))
+                    .map_err(RPolarsErr::from)?
+                    .build();
+            let lf: LazyFrame = dsl.into();
+            Ok(lf.into())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn new_from_csv(
+        source: StringSexp,
+        separator: &str,
+        has_header: bool,
+        ignore_errors: bool,
+        skip_rows: NumericScalar,
+        cache: bool,
+        missing_utf8_is_empty_string: bool,
+        low_memory: bool,
+        rechunk: bool,
+        skip_rows_after_header: NumericScalar,
+        encoding: &str,
+        try_parse_dates: bool,
+        eol_char: &str,
+        raise_if_empty: bool,
+        truncate_ragged_lines: bool,
+        decimal_comma: bool,
+        glob: bool,
+        row_index_offset: NumericScalar,
+        comment_prefix: Option<&str>,
+        quote_char: Option<&str>,
+        null_values: Option<StringSexp>,
+        infer_schema_length: Option<NumericScalar>,
+        row_index_name: Option<&str>,
+        n_rows: Option<NumericScalar>,
+        overwrite_dtype: Option<ListSexp>,
+        schema: Option<ListSexp>,
+        storage_options: Option<StringSexp>,
+        include_file_paths: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let sources = <Wrap<ScanSources>>::try_from(source)?.0;
+            let encoding = <Wrap<CsvEncoding>>::try_from(encoding)?.0;
+            let skip_rows = <Wrap<usize>>::try_from(skip_rows)?.0;
+            let skip_rows_after_header = <Wrap<usize>>::try_from(skip_rows_after_header)?.0;
+            let infer_schema_length = match infer_schema_length {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let row_index_offset = <Wrap<u32>>::try_from(row_index_offset)?.0;
+            let n_rows = match n_rows {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let null_values = match null_values {
+                Some(x) => Some(<Wrap<NullValues>>::try_from(x)?.0),
+                None => None,
+            };
+            let quote_char = quote_char
+                .map(|s| {
+                    s.as_bytes().first().ok_or_else(
+                        || polars_err!(InvalidOperation: "`quote_char` cannot be empty"),
+                    )
+                })
+                .transpose()
+                .map_err(RPolarsErr::from)?
+                .copied();
+            let separator = separator
+                .as_bytes()
+                .first()
+                .ok_or_else(|| polars_err!(InvalidOperation: "`separator` cannot be empty"))
+                .copied()
+                .map_err(RPolarsErr::from)?;
+            let eol_char = eol_char
+                .as_bytes()
+                .first()
+                .ok_or_else(|| polars_err!(InvalidOperation: "`eol_char` cannot be empty"))
+                .copied()
+                .map_err(RPolarsErr::from)?;
+            let row_index = row_index_name.map(|x| RowIndex {
+                name: x.into(),
+                offset: row_index_offset,
+            });
+            let overwrite_dtype = match overwrite_dtype {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?.0),
+                None => None,
+            };
+            let schema = match schema {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?.0),
+                None => None,
+            };
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let first_path = sources.first_path().map(|p| p.to_owned());
+            let cloud_schema = first_path.and_then(|p| CloudScheme::from_path(p.as_str()));
+
+            let cloud_options = parse_cloud_options(cloud_schema, storage_options)?;
+
+            LazyCsvReader::new_with_sources(sources)
+                .with_cloud_options(cloud_options)
+                .with_infer_schema_length(infer_schema_length)
+                .with_separator(separator)
+                .with_has_header(has_header)
+                .with_ignore_errors(ignore_errors)
+                .with_skip_rows(skip_rows)
+                .with_n_rows(n_rows)
+                .with_cache(cache)
+                .with_dtype_overwrite(overwrite_dtype.map(Arc::new))
+                .with_schema(schema.map(Arc::new))
+                .with_low_memory(low_memory)
+                .with_comment_prefix(comment_prefix.map(|x| x.into()))
+                .with_quote_char(quote_char)
+                .with_eol_char(eol_char)
+                .with_rechunk(rechunk)
+                .with_skip_rows_after_header(skip_rows_after_header)
+                .with_encoding(encoding)
+                .with_row_index(row_index)
+                .with_try_parse_dates(try_parse_dates)
+                .with_null_values(null_values)
+                .with_missing_is_null(!missing_utf8_is_empty_string)
+                .with_truncate_ragged_lines(truncate_ragged_lines)
+                .with_decimal_comma(decimal_comma)
+                .with_glob(glob)
+                .with_raise_if_empty(raise_if_empty)
+                .with_include_file_paths(include_file_paths.map(|x| x.into()))
+                .finish()
+                .map_err(RPolarsErr::from)
+                .map(PlRLazyFrame::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn new_from_parquet(
+        source: StringSexp,
+        cache: bool,
+        parallel: &str,
+        rechunk: bool,
+        low_memory: bool,
+        use_statistics: bool,
+        try_parse_hive_dates: bool,
+        glob: bool,
+        missing_columns: &str,
+        row_index_offset: NumericScalar,
+        storage_options: Option<StringSexp>,
+        n_rows: Option<NumericScalar>,
+        row_index_name: Option<&str>,
+        hive_partitioning: Option<bool>,
+        schema: Option<ListSexp>,
+        hive_schema: Option<ListSexp>,
+        include_file_paths: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let sources = <Wrap<ScanSources>>::try_from(source)?.0;
+            let row_index_offset = <Wrap<u32>>::try_from(row_index_offset)?.0;
+            let n_rows = match n_rows {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let parallel = <Wrap<ParallelStrategy>>::try_from(parallel)?.0;
+            let hive_schema = match hive_schema {
+                Some(x) => Some(Arc::new(<Wrap<Schema>>::try_from(x)?.0)),
+                None => None,
+            };
+            let schema = match schema {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?.0),
+                None => None,
+            };
+            let missing_columns_policy = <Wrap<MissingColumnsPolicy>>::try_from(missing_columns)?.0;
+            let row_index = row_index_name.map(|x| RowIndex {
+                name: x.into(),
+                offset: row_index_offset,
+            });
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+            let hive_options = HiveOptions {
+                enabled: hive_partitioning,
+                hive_start_idx: 0,
+                schema: hive_schema,
+                try_parse_dates: try_parse_hive_dates,
+            };
+
+            let options = ParquetOptions {
+                schema: schema.map(Arc::new),
+                parallel,
+                low_memory,
+                use_statistics,
+            };
+
+            let first_path = sources.first_path().map(|p| p.to_owned());
+            let cloud_schema = first_path.and_then(|p| CloudScheme::from_path(p.as_str()));
+
+            let cloud_options = parse_cloud_options(cloud_schema, storage_options)?;
+
+            let unified_scan_args = UnifiedScanArgs {
+                cloud_options,
+                pre_slice: n_rows.map(|len| Slice::Positive { offset: 0, len }),
+                cache,
+                rechunk,
+                row_index,
+                hive_options,
+                include_file_paths: include_file_paths.map(|x| x.into()),
+                glob,
+                missing_columns_policy,
+                ..Default::default()
+            };
+
+            let lf: LazyFrame = DslBuilder::scan_parquet(sources, options, unified_scan_args)
+                .map_err(RPolarsErr::from)?
+                .build()
+                .into();
+
+            Ok(lf.into())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn new_from_ndjson(
+        source: StringSexp,
+        low_memory: bool,
+        rechunk: bool,
+        ignore_errors: bool,
+        row_index_offset: NumericScalar,
+        row_index_name: Option<&str>,
+        infer_schema_length: Option<NumericScalar>,
+        schema: Option<ListSexp>,
+        schema_overrides: Option<ListSexp>,
+        batch_size: Option<NumericScalar>,
+        n_rows: Option<NumericScalar>,
+        include_file_paths: Option<&str>,
+        storage_options: Option<StringSexp>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let sources = <Wrap<ScanSources>>::try_from(source)?.0;
+            let row_index_offset = <Wrap<u32>>::try_from(row_index_offset)?.0;
+            let infer_schema_length = match infer_schema_length {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let batch_size = match batch_size {
+                Some(x) => Some(<Wrap<NonZeroUsize>>::try_from(x)?.0),
+                None => None,
+            };
+            let n_rows = match n_rows {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let schema = match schema {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?.0),
+                None => None,
+            };
+            let schema_overrides = match schema_overrides {
+                Some(x) => Some(<Wrap<Schema>>::try_from(x)?.0),
+                None => None,
+            };
+            let row_index = row_index_name.map(|x| RowIndex {
+                name: x.into(),
+                offset: row_index_offset,
+            });
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let first_path = sources.first_path().map(|p| p.to_owned());
+            let cloud_schema = first_path.and_then(|p| CloudScheme::from_path(p.as_str()));
+
+            let cloud_options = parse_cloud_options(cloud_schema, storage_options)?;
+
+            LazyJsonLineReader::new_with_sources(sources)
+                .with_cloud_options(cloud_options)
+                .with_infer_schema_length(infer_schema_length.and_then(NonZeroUsize::new))
+                .with_batch_size(batch_size)
+                .with_n_rows(n_rows)
+                .low_memory(low_memory)
+                .with_rechunk(rechunk)
+                .with_schema(schema.map(Arc::new))
+                .with_schema_overwrite(schema_overrides.map(Arc::new))
+                .with_row_index(row_index)
+                .with_ignore_errors(ignore_errors)
+                .with_include_file_paths(include_file_paths.map(|x| x.into()))
+                .finish()
+                .map_err(RPolarsErr::from)
+                .map(PlRLazyFrame::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn sink_parquet(
+        &self,
+        target: Sexp,
+        compression: &str,
+        stat_min: bool,
+        stat_max: bool,
+        stat_distinct_count: bool,
+        stat_null_count: bool,
+        sync_on_close: &str,
+        maintain_order: bool,
+        mkdir: bool,
+        compression_level: Option<NumericScalar>,
+        row_group_size: Option<NumericScalar>,
+        data_page_size: Option<NumericScalar>,
+        storage_options: Option<StringSexp>,
+        // TODO: support these arguments
+        // metadata,
+        // field_overwrites,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = <Wrap<SinkDestination>>::try_from(target)?.0;
+
+            let statistics = StatisticsOptions {
+                min_value: stat_min,
+                max_value: stat_max,
+                null_count: stat_null_count,
+                distinct_count: stat_distinct_count,
+            };
+            let compression_level: Option<i32> = match compression_level {
+                Some(x) => Some(x.as_i32()?),
+                None => None,
+            };
+            let compression = parse_parquet_compression(compression, compression_level)?;
+            let row_group_size: Option<usize> = match row_group_size {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let data_page_size: Option<usize> = match data_page_size {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let options = ParquetWriteOptions {
+                compression,
+                statistics,
+                row_group_size,
+                data_page_size,
+                key_value_metadata: None,
+                arrow_schema: None,
+                compat_level: None,
+            };
+
+            let cloud_options = parse_cloud_options(target.cloud_scheme(), storage_options)?;
+
+            let unified_sink_args = UnifiedSinkArgs {
+                mkdir,
+                maintain_order,
+                sync_on_close: <Wrap<SyncOnCloseType>>::try_from(sync_on_close)?.0,
+                cloud_options: cloud_options.map(Arc::new),
+            };
+
+            self.ldf
+                .clone()
+                .sink(
+                    target,
+                    FileWriteFormat::Parquet(Arc::new(options)),
+                    unified_sink_args,
+                )
+                .map(Into::into)
+                .map_err(RPolarsErr::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn sink_csv(
+        &self,
+        target: Sexp,
+        include_bom: bool,
+        compression: &str,
+        check_extension: bool,
+        include_header: bool,
+        separator: &str,
+        line_terminator: &str,
+        quote_char: &str,
+        batch_size: NumericScalar,
+        sync_on_close: &str,
+        maintain_order: bool,
+        mkdir: bool,
+        decimal_comma: bool,
+        datetime_format: Option<&str>,
+        date_format: Option<&str>,
+        time_format: Option<&str>,
+        float_scientific: Option<bool>,
+        float_precision: Option<NumericScalar>,
+        null_value: Option<&str>,
+        quote_style: Option<&str>,
+        storage_options: Option<StringSexp>,
+        compression_level: Option<NumericScalar>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = <Wrap<SinkDestination>>::try_from(target)?.0;
+
+            let quote_style = match quote_style {
+                Some(x) => <Wrap<QuoteStyle>>::try_from(x)?.0,
+                None => QuoteStyle::default(),
+            };
+            let null_value = null_value
+                .map(PlSmallStr::from_str)
+                .unwrap_or(SerializeOptions::default().null);
+            let batch_size = <Wrap<NonZeroUsize>>::try_from(batch_size)?.0;
+            let float_precision = match float_precision {
+                Some(x) => Some(<Wrap<usize>>::try_from(x)?.0),
+                None => None,
+            };
+            let separator = <Wrap<u8>>::try_from(separator)?.0;
+            let quote_char = <Wrap<u8>>::try_from(quote_char)?.0;
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+            let compression_level = match compression_level {
+                Some(x) => Some(<Wrap<u32>>::try_from(x)?.0),
+                None => None,
+            };
+
+            let serialize_options = SerializeOptions {
+                date_format: date_format.map(PlSmallStr::from_str),
+                time_format: time_format.map(PlSmallStr::from_str),
+                datetime_format: datetime_format.map(PlSmallStr::from_str),
+                float_scientific,
+                float_precision,
+                decimal_comma,
+                separator,
+                quote_char,
+                null: null_value,
+                line_terminator: PlSmallStr::from_str(line_terminator),
+                quote_style,
+            };
+
+            let options = CsvWriterOptions {
+                include_bom,
+                include_header,
+                batch_size,
+                serialize_options: serialize_options.into(),
+                compression: ExternalCompression::try_from(compression, compression_level)
+                    .map_err(RPolarsErr::from)?,
+                check_extension,
+            };
+
+            let cloud_options = parse_cloud_options(target.cloud_scheme(), storage_options)?;
+
+            let unified_sink_args = UnifiedSinkArgs {
+                mkdir,
+                maintain_order,
+                sync_on_close: <Wrap<SyncOnCloseType>>::try_from(sync_on_close)?.0,
+                cloud_options: cloud_options.map(Arc::new),
+            };
+
+            self.ldf
+                .clone()
+                .sink(target, FileWriteFormat::Csv(options), unified_sink_args)
+                .map(Into::into)
+                .map_err(RPolarsErr::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn sink_ndjson(
+        &self,
+        target: Sexp,
+        compression: &str,
+        check_extension: bool,
+        sync_on_close: &str,
+        maintain_order: bool,
+        mkdir: bool,
+        compression_level: Option<NumericScalar>,
+        storage_options: Option<StringSexp>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = <Wrap<SinkDestination>>::try_from(target)?.0;
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let compression_level = match compression_level {
+                Some(x) => Some(<Wrap<u32>>::try_from(x)?.0),
+                None => None,
+            };
+            let options = NDJsonWriterOptions {
+                compression: ExternalCompression::try_from(compression, compression_level)
+                    .map_err(RPolarsErr::from)?,
+                check_extension,
+            };
+
+            let cloud_options = parse_cloud_options(target.cloud_scheme(), storage_options)?;
+            let unified_sink_args = UnifiedSinkArgs {
+                mkdir,
+                maintain_order,
+                sync_on_close: <Wrap<SyncOnCloseType>>::try_from(sync_on_close)?.0,
+                cloud_options: cloud_options.map(Arc::new),
+            };
+
+            self.ldf
+                .clone()
+                .sink(target, FileWriteFormat::NDJson(options), unified_sink_args)
+                .map(Into::into)
+                .map_err(RPolarsErr::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+
+    fn sink_ipc(
+        &self,
+        target: Sexp,
+        compression: &str,
+        compat_level: Sexp,
+        sync_on_close: &str,
+        maintain_order: bool,
+        mkdir: bool,
+        storage_options: Option<StringSexp>,
+    ) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = <Wrap<SinkDestination>>::try_from(target)?.0;
+            let compression: Option<IpcCompression> =
+                <Wrap<Option<IpcCompression>>>::try_from(compression)?.0;
+            let compat_level = <Wrap<CompatLevel>>::try_from(compat_level)?.0;
+            let storage_options = match storage_options {
+                Some(x) => {
+                    let out = <Wrap<Vec<(String, String)>>>::try_from(x)
+                        .map_err(|_| {
+                            RPolarsErr::Other(
+                                "`storage_options` must be a named character vector".to_string(),
+                            )
+                        })?
+                        .0;
+                    Some(out)
+                }
+                None => None,
+            };
+
+            let options = IpcWriterOptions {
+                compression,
+                compat_level,
+                ..Default::default()
+            };
+
+            let cloud_options = parse_cloud_options(target.cloud_scheme(), storage_options)?;
+
+            let unified_sink_args = UnifiedSinkArgs {
+                mkdir,
+                maintain_order,
+                sync_on_close: <Wrap<SyncOnCloseType>>::try_from(sync_on_close)?.0,
+                cloud_options: cloud_options.map(Arc::new),
+            };
+
+            self.ldf
+                .clone()
+                .sink(target, FileWriteFormat::Ipc(options), unified_sink_args)
+                .map(Into::into)
+                .map_err(RPolarsErr::from)
+                .map_err(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RPolarsErr::Other(format!("Not supported in WASM")).into())
+        }
+    }
+}
