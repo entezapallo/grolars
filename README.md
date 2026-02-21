@@ -1,10 +1,6 @@
 # grolars <img src="imgs_readme/logo.png" align="right" height="190" alt="grolars logo" />
 
 
-
-
-## Overview
-
 *El grolar es un híbrido natural entre el grizzly y el polar. Hace un siglo era un milagro, pero con la velocidad que está cambiando el mundo moderno, se hacen cada vez más comunes.*
 
 `polars` es un gran gestor de dataframes, pero la API del paquete `r-polars` está diseñada desde una perspectiva pythonista. Este branch del paquete original busca reimplementar la API usando los mismos binders de base, pero **tidy-first**: usando las convenciones estándar de R y no ser una mera copia de Python en R.
