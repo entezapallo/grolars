@@ -1,4 +1,4 @@
-# grolars <img src="imgs_readme/logo.png" align="right" height="170" alt="grolars logo" />
+# grolars <img src="imgs_readme/logo.png" align="right" height="190" alt="grolars logo" />
 
 
 
