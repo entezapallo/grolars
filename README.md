@@ -1,5 +1,8 @@
 # grolars <img src="imgs_readme/logo.png" align="right" height="170" alt="grolars logo" />
 
+
+
+
 ## Overview
 
 *El grolar es un híbrido natural entre el grizzly y el polar. Hace un siglo era un milagro, pero con la velocidad que está cambiando el mundo moderno, se hacen cada vez más comunes.*
