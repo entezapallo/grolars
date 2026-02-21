@@ -1,4 +1,4 @@
-# grolars <img src="imgs_readme/logo.png" align="right" height="138" alt="grolars logo" />
+# grolars <img src="imgs_readme/logo.png" align="right" height="170" alt="grolars logo" />
 
 ## Overview
 
@@ -13,9 +13,9 @@ La idea es hacer un híbrido — la velocidad de rust-polars con el ecosistema m
 > ⚠️ Paquete en desarrollo activo. Aún no hay protocolo estable y el único objetivo (por ahora) de este repo es tener un respaldo para usar en diferentes máquinas. Solo se ha probado en distros Linux debian-based. Comportamiento en macOS, otras distros o Windows es desconocido.
 
 **Dependencias R:**
-```r
-# R (>= 4.3), rlang (>= 1.1.0), S7 (>= 0.2.1), arrow, bit64, blob, carrier (>= 0.2.0), cli, clock, curl, data.table, ggplot2, hms, jsonlite, knitr, mirai (>= 2.3.0), nanoarrow (>= 0.6.0), nycflights13, patrick (>= 0.3.0), pillar, pkgload, purrr (>= 1.1.0), reticulate (>= 1.43.0), rmarkdown, testthat (>= 3.3.2), tibble (>= 3.3.0), vctrs, withr
-```
+
+-R (>= 4.3), rlang (>= 1.1.0), S7 (>= 0.2.1), arrow, bit64, blob, carrier (>= 0.2.0), cli, clock, curl, data.table, ggplot2, hms, jsonlite, knitr, mirai (>= 2.3.0), nanoarrow (>= 0.6.0), nycflights13, patrick (>= 0.3.0), pillar, pkgload, purrr (>= 1.1.0), reticulate (>= 1.43.0), rmarkdown, testthat (>= 3.3.2), tibble (>= 3.3.0), vctrs, withr
+
 
 **Dependencias del sistema:**
 - Rust >= 1.89.9, polars, savvy>=0.9
@@ -35,7 +35,7 @@ cd grolars && R CMD INSTALL . --no-multiarch
 Este paquete es **altamente experimental, sin ninguna garantía**. Si su sistema se rompe o su R se desconfigura, es su responsabilidad.
 
 
-![](imgs_readme/unberlini.png)
+<img src="imgs_readme/unberlini.png" height="150">
 
 Se recomienda el uso en contenedores o máquinas virtuales. **No apto para producción.**
 
