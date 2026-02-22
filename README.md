@@ -1,9 +1,12 @@
+traducemelo.
 # grolars <img src="imgs_readme/logo.png" align="right" height="190" alt="grolars logo" />
 
 
-*El grolar es un híbrido natural entre el grizzly y el polar. Hace un siglo era un milagro, pero con la velocidad que está cambiando el mundo moderno, se hacen cada vez más comunes.*
+*El grolar es un híbrido natural entre el oso grizzly y el oso polar. Hace un siglo era un milagro, pero con la velocidad que está cambiando el mundo moderno, se hacen cada vez más comunes.*
 
-`polars` es un gran gestor de dataframes, pero la API del paquete `r-polars` está diseñada desde una perspectiva pythonista. Este branch del paquete original busca reimplementar la API usando los mismos binders de base, pero **tidy-first**: usando las convenciones estándar de R y no ser una mera copia de Python en R.
+**Overview**
+
+`polars` es un gran gestor de dataframes, se recomienda usar para archivos sobre 100 mb, que representen un problema en memoria ram o sean demasiado para la maquina de trabajo. El problema aca es que la API del paquete `r-polars` está diseñada desde una perspectiva pythonista. Este branch del paquete original busca reimplementar la API usando los mismos binders de base, pero **tidy-first**: usando las convenciones estándar de R y no ser una mera copia de Python en R.
 
 La idea es hacer un híbrido — la velocidad de rust-polars con el ecosistema maduro, data-driven y ya conocido del tidyverse.
 
@@ -11,7 +14,7 @@ La idea es hacer un híbrido — la velocidad de rust-polars con el ecosistema m
 
 > ⚠️ Paquete en desarrollo activo. Aún no hay protocolo estable y el único objetivo (por ahora) de este repo es tener un respaldo para usar en diferentes máquinas. Solo se ha probado en distros Linux debian-based. Comportamiento en macOS, otras distros o Windows es desconocido.
 
-**Dependencias R:**
+**Dependencias**
 
 -R (>= 4.3), rlang (>= 1.1.0), S7 (>= 0.2.1), arrow, bit64, blob, carrier (>= 0.2.0), cli, clock, curl, data.table, ggplot2, hms, jsonlite, knitr, mirai (>= 2.3.0), nanoarrow (>= 0.6.0), nycflights13, patrick (>= 0.3.0), pillar, pkgload, purrr (>= 1.1.0), reticulate (>= 1.43.0), rmarkdown, testthat (>= 3.3.2), tibble (>= 3.3.0), vctrs, withr
 
@@ -23,12 +26,22 @@ La idea es hacer un híbrido — la velocidad de rust-polars con el ecosistema m
 **Instalación:**
 ```bash
 git clone https://github.com/entezapallo/grolars
-# o
-wget https://github.com/entezapallo/grolars/archive/refs/heads/main.zip
-
-cd grolars && R CMD INSTALL . --no-multiarch
+cd grolars 
+MAKEFLAGS="" R CMD INSTALL . --no-multiarch
 ```
+## Uso
 
+source("R/readers_grolars.r")
+source("R/translator_r2polars.r")
+source("R/tidyverbs.r")
+source("R/print_utils.r")
+
+pldf<-grl_read_csv("dummydata.csv", mode="lazy") |>
+  filter(Sepal.Length > 5) |>
+  select(Sepal.Length, Species) |>
+  grl_collect()
+
+pldf|>print()
 ## ⚠️ Avisos
 
 Este paquete es **altamente experimental, sin ninguna garantía**. Si su sistema se rompe o su R se desconfigura, es su responsabilidad.
@@ -37,8 +50,7 @@ Este paquete es **altamente experimental, sin ninguna garantía**. Si su sistema
 <img src="imgs_readme/unberlini.png" height="150">
 
 Se recomienda el uso en contenedores o máquinas virtuales. **No apto para producción.**
-
-Todo aporte es bienvenido. Se ruega comunicar issues, bugs, comportamientos extraños o novedosos.
+Todo aporte y nueva feature  es bienvenido. Se ruega comunicar issues, bugs, comportamientos extraños o novedosos.
 
 ---
 
