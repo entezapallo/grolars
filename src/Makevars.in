@@ -31,14 +31,14 @@ $(STATLIB): remove-prev
 	fi && \
 	export PATH="$(PATH):$(HOME)/.cargo/bin" && \
 	  if [ "$(TARGET)" != "wasm32-unknown-emscripten" ]; then \
-	    cargo build $(CARGO_BUILD_ARGS); \
+	    MAKEFLAGS="" cargo build $(CARGO_BUILD_ARGS); \
 	  else \
 	    export CC="$(CC)" && \
 	    export CFLAGS="$(CFLAGS)" && \
 	    export CARGO_PROFILE_DEV_PANIC="abort" && \
 	    export CARGO_PROFILE_RELEASE_PANIC="abort" && \
 	    export RUSTFLAGS="$(RUSTFLAGS) -Zdefault-visibility=hidden" && \
-	    cargo build $(CARGO_BUILD_ARGS) -Zbuild-std=panic_abort,std; \
+	    MAKEFLAGS="" cargo build $(CARGO_BUILD_ARGS) -Zbuild-std=panic_abort,std; \
 	  fi
 
 .PHONY: remove-prev
