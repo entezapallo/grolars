@@ -30,7 +30,8 @@ cd grolars
 MAKEFLAGS="" R CMD INSTALL . --no-multiarch
 ```
 ## Uso
-
+```{r}
+library(polars)
 source("R/readers_grolars.r")
 source("R/translator_r2polars.r")
 source("R/tidyverbs.r")
@@ -42,6 +43,7 @@ pldf<-grl_read_csv("dummydata.csv", mode="lazy") |>
   grl_collect()
 
 pldf|>print()
+```
 ## ⚠️ Avisos
 
 Este paquete es **altamente experimental, sin ninguna garantía**. Si su sistema se rompe o su R se desconfigura, es su responsabilidad.
