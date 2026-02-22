@@ -16,12 +16,10 @@
 select.PlRLazyFrame <- function(.data, ...) {
   cols <- as.character(rlang::ensyms(...))
   schema <- .schema(.data)
-  unknown <- setdiff(cols, schema)
-  if (length(unknown)) stop("Columns not found: ", paste(unknown, collapse = ", "))
-  exprs <- lapply(cols, polars:::col)
-  .propagate(.data$select(exprs), cols)
+  real_cols <- sapply(cols, .match_col, schema = schema)
+  exprs <- lapply(real_cols, polars:::col)
+  .propagate(.data$select(exprs), real_cols)
 }
-
 select.PlRDataFrame <- function(.data, ...) {
   cols <- as.character(rlang::ensyms(...))
   schema <- .schema(.data)
@@ -75,7 +73,6 @@ mutate.PlRDataFrame <- function(.data, ...) {
 arrange.PlRLazyFrame <- function(.data, ...) {
   schema <- .schema(.data)
   quos <- rlang::enquos(...)
-  # detect desc() wrapper
   exprs <- lapply(quos, function(q) {
     expr <- rlang::get_expr(q)
     if (is.call(expr) && as.character(expr[[1]]) == "desc") {
@@ -174,7 +171,6 @@ summarise.PlRLazyGroupBy <- function(.data, ...) {
   .propagate(result, union(keys, names(quos)))
 }
 
-# alias
 summarize.PlRLazyGroupBy <- summarise.PlRLazyGroupBy
 
 # ---- slice ----
@@ -195,23 +191,22 @@ slice.PlRDataFrame <- function(.data, rows) {
 
 # ---- register S3 methods ----
 
-# dplyr generics
-registerS3method("select",    "PlRLazyFrame",    select.PlRLazyFrame,    envir = asNamespace("dplyr"))
-registerS3method("select",    "PlRDataFrame",    select.PlRDataFrame,    envir = asNamespace("dplyr"))
-registerS3method("filter",    "PlRLazyFrame",    filter.PlRLazyFrame,    envir = asNamespace("dplyr"))
-registerS3method("filter",    "PlRDataFrame",    filter.PlRDataFrame,    envir = asNamespace("dplyr"))
-registerS3method("mutate",    "PlRLazyFrame",    mutate.PlRLazyFrame,    envir = asNamespace("dplyr"))
-registerS3method("mutate",    "PlRDataFrame",    mutate.PlRDataFrame,    envir = asNamespace("dplyr"))
-registerS3method("arrange",   "PlRLazyFrame",    arrange.PlRLazyFrame,   envir = asNamespace("dplyr"))
-registerS3method("arrange",   "PlRDataFrame",    arrange.PlRDataFrame,   envir = asNamespace("dplyr"))
-registerS3method("rename",    "PlRLazyFrame",    rename.PlRLazyFrame,    envir = asNamespace("dplyr"))
-registerS3method("rename",    "PlRDataFrame",    rename.PlRDataFrame,    envir = asNamespace("dplyr"))
-registerS3method("distinct",  "PlRLazyFrame",    distinct.PlRLazyFrame,  envir = asNamespace("dplyr"))
-registerS3method("distinct",  "PlRDataFrame",    distinct.PlRDataFrame,  envir = asNamespace("dplyr"))
-registerS3method("group_by",  "PlRLazyFrame",    group_by.PlRLazyFrame,  envir = asNamespace("dplyr"))
-registerS3method("summarise", "PlRLazyGroupBy",  summarise.PlRLazyGroupBy, envir = asNamespace("dplyr"))
-registerS3method("summarize", "PlRLazyGroupBy",  summarize.PlRLazyGroupBy, envir = asNamespace("dplyr"))
-registerS3method("slice",     "PlRLazyFrame",    slice.PlRLazyFrame,     envir = asNamespace("dplyr"))
-registerS3method("slice",     "PlRDataFrame",    slice.PlRDataFrame,     envir = asNamespace("dplyr"))
-registerS3method("drop_na",   "PlRLazyFrame",    drop_na.PlRLazyFrame,   envir = asNamespace("tidyr"))
-registerS3method("drop_na",   "PlRDataFrame",    drop_na.PlRDataFrame,   envir = asNamespace("tidyr"))
+registerS3method("select",    "PlRLazyFrame",   select.PlRLazyFrame,    envir = asNamespace("dplyr"))
+registerS3method("select",    "PlRDataFrame",   select.PlRDataFrame,    envir = asNamespace("dplyr"))
+registerS3method("filter",    "PlRLazyFrame",   filter.PlRLazyFrame,    envir = asNamespace("dplyr"))
+registerS3method("filter",    "PlRDataFrame",   filter.PlRDataFrame,    envir = asNamespace("dplyr"))
+registerS3method("mutate",    "PlRLazyFrame",   mutate.PlRLazyFrame,    envir = asNamespace("dplyr"))
+registerS3method("mutate",    "PlRDataFrame",   mutate.PlRDataFrame,    envir = asNamespace("dplyr"))
+registerS3method("arrange",   "PlRLazyFrame",   arrange.PlRLazyFrame,   envir = asNamespace("dplyr"))
+registerS3method("arrange",   "PlRDataFrame",   arrange.PlRDataFrame,   envir = asNamespace("dplyr"))
+registerS3method("rename",    "PlRLazyFrame",   rename.PlRLazyFrame,    envir = asNamespace("dplyr"))
+registerS3method("rename",    "PlRDataFrame",   rename.PlRDataFrame,    envir = asNamespace("dplyr"))
+registerS3method("distinct",  "PlRLazyFrame",   distinct.PlRLazyFrame,  envir = asNamespace("dplyr"))
+registerS3method("distinct",  "PlRDataFrame",   distinct.PlRDataFrame,  envir = asNamespace("dplyr"))
+registerS3method("group_by",  "PlRLazyFrame",   group_by.PlRLazyFrame,  envir = asNamespace("dplyr"))
+registerS3method("summarise", "PlRLazyGroupBy", summarise.PlRLazyGroupBy, envir = asNamespace("dplyr"))
+registerS3method("summarize", "PlRLazyGroupBy", summarize.PlRLazyGroupBy, envir = asNamespace("dplyr"))
+registerS3method("slice",     "PlRLazyFrame",   slice.PlRLazyFrame,     envir = asNamespace("dplyr"))
+registerS3method("slice",     "PlRDataFrame",   slice.PlRDataFrame,     envir = asNamespace("dplyr"))
+registerS3method("drop_na",   "PlRLazyFrame",   drop_na.PlRLazyFrame,   envir = asNamespace("tidyr"))
+registerS3method("drop_na",   "PlRDataFrame",   drop_na.PlRDataFrame,   envir = asNamespace("tidyr"))

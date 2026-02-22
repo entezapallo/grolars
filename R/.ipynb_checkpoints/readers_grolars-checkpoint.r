@@ -1,5 +1,10 @@
-.get_schema <- function(lf) gsub('"', '', names(lf$collect_schema()))
+.get_schema <- function(lf) names(lf$collect_schema())  # guarda "\"Sepal.Length\""
 
+.match_col <- function(name, schema) {
+  match <- schema[grepl(paste0('"', name, '"'), schema, fixed = TRUE)]
+  if (length(match) == 0) stop("Column '", name, "' not found")
+  match[1]
+}
 .lazy_readers <- list(
   csv     = function(p) polars:::PlRLazyFrame$new_from_csv(
     source                       = p$source,
